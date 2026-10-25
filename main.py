@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           ContextTypes, PicklePersistence, filters)
+import io
+from PIL import Image, ImageOps
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -17,13 +19,19 @@ CATEGORIAS = {"musiwand", "animawand", "cinewand", "gamewand", "multiwand"}
 MAX_ABERTOS = 3                             # pedidos abertos por usuário
 TEMPO_SEM_RESPOSTA = 3600                   # 1 hora
 TEMPO_DELETAR = 86400                       # 24 horas depois de fechar
+PROPORCAO_ALVO = 3 / 4                      # 0.75 (padrão 3:4 vertical)
+TOLERANCIA = 0.02                           # 2% de margem para variações de pixels
+TAMANHO_CARTA = (600, 800)                  # Resolução 3:4 gerada pelo /recortar
 
 USO = (
     "📌 Envie a imagem da carta juntamente com esta legenda:\n\n"
     "/adicao nome, raridade, coleção, categoria, tag, créditos\n\n"
     "Tag e créditos são opcionais (deixe vazio se não tiver).\n"
-    "Exemplo: /adicao Batman, lendaria, DC Comics, Liga da Justiça"
+    "Exemplo: /adicao Batman, lendaria, DC Comics, Liga da Justiça\n\n"
+    "✂️ Imagem fora da proporção 3:4? Envie a foto com a legenda /recortar "
+    "(ou responda a uma foto com /recortar) para cortar automaticamente no centro!"
 )
+
 
 
 def pedidos(context):
@@ -48,7 +56,82 @@ def interpretar(legenda: str):
     return {"nome": nome, "raridade": raridade.lower(), "col": col,
             "categ": categ.capitalize(), "tag": tag, "creditos": creditos}, None
 
+async def verificar_proporcao(m, bot):
+    # Se foi enviada como foto normal, o Telegram já entrega largura e altura sem baixar nada
+    if m.photo:
+        largura, altura = m.photo[-1].width, m.photo[-1].height
+    else:
+        # Se foi enviada como documento/arquivo, baixa na memória para ler as dimensões
+        arquivo_tg = await bot.get_file(m.document.file_id)
+        buffer = io.BytesIO()
+        await arquivo_tg.download_to_memory(out=buffer)
+        buffer.seek(0)
+        with Image.open(buffer) as img:
+            largura, altura = img.size
 
+    proporcao_atual = largura / altura
+    dentro_do_padrao = abs(proporcao_atual - PROPORCAO_ALVO) <= TOLERANCIA
+    return dentro_do_padrao, largura, altura
+
+async def recortar_no_centro(bot, file_id: str) -> io.BytesIO:
+    arquivo_tg = await bot.get_file(file_id)
+    buffer_entrada = io.BytesIO()
+    await arquivo_tg.download_to_memory(out=buffer_entrada)
+    buffer_entrada.seek(0)
+
+    with Image.open(buffer_entrada) as img:
+        img = img.convert("RGB")
+        # Recorta na proporção 3:4 exatamente a partir do centro (0.5, 0.5) sem achatar a imagem
+        img_cortada = ImageOps.fit(
+            img,
+            TAMANHO_CARTA,
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+        buffer_saida = io.BytesIO()
+        img_cortada.save(buffer_saida, format="JPEG", quality=92)
+        buffer_saida.seek(0)
+        return buffer_saida
+
+
+# /recortar na legenda da foto OU respondendo a uma foto
+async def recortar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+
+    # Verifica se a imagem está na própria mensagem ou na mensagem que o utilizador respondeu
+    alvo = m if (m.photo or m.document) else m.reply_to_message
+    eh_doc_imagem = bool(alvo and alvo.document and alvo.document.mime_type and alvo.document.mime_type.startswith("image/"))
+
+    if not alvo or not (alvo.photo or eh_doc_imagem):
+        await m.reply_text(
+            "✂️ <b>Como usar o recorte automático (3:4):</b>\n\n"
+            "• Envie uma foto com a legenda <code>/recortar</code>, ou\n"
+            "• Responda a uma foto que você já enviou com <code>/recortar</code>.\n\n"
+            "⚠️ <i>O recorte é feito no centro da imagem. Se o personagem/foco estiver nos cantos, faça o recorte manualmente.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    file_id = alvo.photo[-1].file_id if alvo.photo else alvo.document.file_id
+
+    try:
+        img_pronta = await recortar_no_centro(context.bot, file_id)
+
+        # Se o utilizador respondeu a uma foto que já tinha a legenda "/adicao ...", devolve a legenda pronta para copiar
+        legenda_antiga = (alvo.caption or "").strip()
+        texto = "✅ <b>Imagem recortada para o padrão 3:4!</b>\n\n"
+        if legenda_antiga.startswith("/adicao"):
+            texto += (
+                "📋 Se o foco ficou bom, envie esta imagem recortada usando a sua legenda (toque para copiar):\n"
+                f"<code>{html.escape(legenda_antiga)}</code>\n\n"
+            )
+        texto += "⚠️ <i>Caso o foco principal tenha sido cortado, recorte a imagem original manualmente antes de enviar.</i>"
+
+        await m.reply_photo(photo=img_pronta, caption=texto, parse_mode="HTML")
+    except Exception as e:
+        print("ERRO AO RECORTAR IMAGEM:", e)
+        await m.reply_text("❌ Não consegui recortar esta imagem. Envie um ficheiro JPG ou PNG válido.")
+        
 # /start e /adicao sem imagem
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔮 Olá! Aqui você pede a adição de novas cartas.\n\n{USO}")
@@ -72,6 +155,26 @@ async def adicao(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     eh_foto = bool(m.photo)
     file_id = m.photo[-1].file_id if eh_foto else m.document.file_id
+    
+    # Verifica se a imagem está na proporção 3:4 antes de criar o pedido
+    try:
+        proporcao_ok, larg, alt = await verificar_proporcao(m, context.bot)
+    except Exception as e:
+        print("ERRO AO LER IMAGEM:", e)
+        await m.reply_text("❌ Não consegui verificar as dimensões da imagem. Envie um arquivo JPG ou PNG válido.")
+        return
+
+    if not proporcao_ok:
+        await m.reply_text(
+            f"❌ <b>Imagem fora da proporção padrão!</b>\n\n"
+            f"📏 Tamanho enviado: <code>{larg}x{alt}px</code>\n"
+            f"📐 Proporção exigida: <b>3:4</b> (ex: 600x800, 750x1000, 900x1200)\n\n"
+            f"💡 <b>Como resolver:</b>\n"
+            f"• Se o foco principal estiver no <b>centro</b>, responda a essa sua foto com /recortar que eu ajusto para você!\n"
+            f"• Se o foco estiver fora do centro, recorte manualmente na proporção 3:4 e envie novamente.",
+            parse_mode="HTML",
+        )
+        return
 
     n = context.bot_data["contador"] = context.bot_data.get("contador", 0) + 1
     nome_topico = f"Adição #{n} - {dados['nome']} ({dados['col']})"[:128]
@@ -268,6 +371,10 @@ app.add_handler(CommandHandler("responder", responder))
 app.add_handler(CommandHandler("aprovar", aprovar))
 app.add_handler(CommandHandler("rejeitar", rejeitar))
 app.add_handler(CommandHandler("id", id_grupo))
+app.add_handler(CommandHandler("recortar", recortar))
+app.add_handler(MessageHandler(
+    filters.ChatType.PRIVATE & filters.CaptionRegex(r"^/recortar") &
+    (filters.PHOTO | filters.Document.IMAGE), recortar))
 
 print("Bot de adições iniciado!")
 app.run_polling()
